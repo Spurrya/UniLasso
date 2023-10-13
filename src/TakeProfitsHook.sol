@@ -15,12 +15,16 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 
+import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
+
 contract TakeProfitsHook is BaseHook, ERC1155 {
 
     using CurrencyLibrary for Currency;
 
     //using PoolIdLibrary for IPoolManager.PoolKey;
     using PoolIdLibrary for PoolKey;
+
+    using FixedPointMathLib for uint256;
 
 
     mapping(PoolId poolId => int24 tickLower) public tickLowerLasts;
@@ -139,6 +143,110 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         IERC20(tokenToBeSoldContract).transfer(msg.sender, amountIn);
     }
 
+    function fillOrder(PoolKey calldata key, int24 tick, bool zeroForOne, int256 amountIn) internal {
+        // Setup the swapping parameters
+        IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: amountIn,
+            // Set the price limit to be the least possible if swapping from Token 0 to Token 1
+            // or the maximum possible if swapping from Token 1 to Token 0
+            // i.e. infinite slippage allowed
+            sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_RATIO + 1 : TickMath.MAX_SQRT_RATIO - 1
+        });
+
+        BalanceDelta delta = abi.decode(
+            poolManager.lock(
+                abi.encodeCall(this._handleSwap, (key, swapParams))
+            ),
+            (BalanceDelta)
+        );
+
+        // Update mapping to reflect that `amountIn` worth of tokens have been swapped from this order
+        takeProfitPositions[key.toId()][tick][zeroForOne] -= amountIn;
+
+        uint256 tokenId = getTokenId(key, tick, zeroForOne);
+
+        // Flip the sign of the delta as tokens we were owed by Uniswap are represented as a negative delta change
+        uint256 amountOfTokensReceivedFromSwap = zeroForOne
+            ? uint256(int256(-delta.amount1()))
+            : uint256(int256(-delta.amount0()));
+
+        // Update the amount of tokens claimable for this order
+        tokenIdClaimable[tokenId] += amountOfTokensReceivedFromSwap;
+    }
+
+    function afterSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, BalanceDelta) external poolManagerOnly returns (bytes4) {
+        
+        int24 lastTickLower = tickLowerLasts[key.toId()];
+
+        // Get the exact current tick and use it to calculate the currentTickLower
+        (, int24 currentTick, , ) = poolManager.getSlot0(key.toId());
+        int24 currentTickLower = _getTickLower(currentTick, key.tickSpacing);
+
+        // We execute orders in the opposite direction
+        // i.e. if someone does a zeroForOne swap to increase price of Token 1, we execute
+        // all orders that are oneForZero
+        // and vice versa
+        bool swapZeroForOne = !params.zeroForOne;
+
+        int256 swapAmountIn;
+
+        // If tick has increased (i.e. price of Token 1 has increased)
+        if (lastTickLower < currentTickLower) {
+            // Loop through all ticks between the lastTickLower and currentTickLower
+            // and execute all orders that are oneForZero
+            for (int24 tick = lastTickLower; tick < currentTickLower; ) {
+                swapAmountIn = takeProfitPositions[key.toId()][tick][swapZeroForOne];
+                if (swapAmountIn > 0) {
+                    fillOrder(key, tick, swapZeroForOne, swapAmountIn);
+                }
+                tick += key.tickSpacing;
+            }
+        } 
+        // Else if tick has decreased (i.e. price of Token 0 has increased)
+        else {
+            // Loop through all ticks between the lastTickLower and currentTickLower
+            // and execute all orders that are zeroForOne
+            for (int24 tick = lastTickLower; currentTickLower < tick; ) {
+                swapAmountIn = takeProfitPositions[key.toId()][tick][swapZeroForOne];
+                if (swapAmountIn > 0) {
+                    fillOrder(key, tick, swapZeroForOne, swapAmountIn);
+                }
+                tick -= key.tickSpacing;
+            }
+        }
+
+        tickLowerLasts[key.toId()] = currentTickLower;
+        
+        return TakeProfitsHook.afterSwap.selector;
+    }
+
+    function redeem(uint256 tokenId, uint256 amountIn, address destination) external {
+        // Make sure there is something to claim
+        require(tokenIdClaimable[tokenId] > 0, "TakeProfitsHook: No tokens to redeem");
+
+        // Make sure user has enough ERC-1155 tokens to redeem the amount they're requesting
+        uint256 balance = balanceOf(msg.sender, tokenId);
+        require(balance >= amountIn, "TakeProfitsHook: Not enough ERC-1155 tokens to redeem requested amount");
+
+        TokenData memory data = tokenIdData[tokenId];
+        address tokenToSendContract = data.zeroForOne ? Currency.unwrap(data.poolKey.currency1) : Currency.unwrap(data.poolKey.currency0);
+
+        // multiple people could have added tokens to the same order, so we need to calculate the amount to send
+        // total supply = total amount of tokens that were part of the order to be sold
+        // therefore, user's share = (amountIn / total supply)
+        // therefore, amount to send to user = (user's share * total claimable)
+
+        // amountToSend = amountIn * (total claimable / total supply)
+        // We use FixedPointMathLib.mulDivDown to avoid rounding errors
+        uint256 amountToSend = amountIn.mulDivDown(tokenIdClaimable[tokenId], tokenIdTotalSupply[tokenId]);
+
+        tokenIdClaimable[tokenId] -= amountToSend;
+        tokenIdTotalSupply[tokenId] -= amountIn;
+        _burn(msg.sender, tokenId, amountIn);
+
+        IERC20(tokenToSendContract).transfer(destination, amountToSend);
+    }
 
     function _handleSwap(
         PoolKey calldata key,
@@ -196,6 +304,9 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
 
         return delta;
     }
+
+
+
 
     // Utility Helpers
     function _setTickLowerLast(PoolId poolId, int24 tickLower) private {
