@@ -178,4 +178,75 @@ contract TakeProfitsHookTest is Test, GasSnapshot {
         _addLiquidityToPool();
     }
 
+    receive() external payable {}
+
+    function onERC1155Received(
+        address,
+        address,
+        uint256,
+        uint256,
+        bytes calldata
+    ) external pure returns (bytes4) {
+        return
+            bytes4(
+                keccak256(
+                    "onERC1155Received(address,address,uint256,uint256,bytes)"
+                )
+            );
+    }
+
+    function onERC1155BatchReceived(
+        address,
+        address,
+        uint256[] calldata,
+        uint256[] calldata,
+        bytes calldata
+    ) external pure returns (bytes4) {
+        return
+            bytes4(
+                keccak256(
+                    "onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)"
+                )
+            );
+    }
+
+
+    function test_placeOrder() public {
+        // Place a zeroForOne take-profit order
+        // for 10e18 token0 tokens
+        // at tick 100
+
+        int24 tick = 100;
+        uint256 amount = 10 ether;
+        bool zeroForOne = true;
+
+        // Note the original balance of token0 we have
+        uint256 originalBalance = token0.balanceOf(address(this));
+
+        // Place the order
+        token0.approve(address(hook), amount);
+        int24 tickLower = hook.placeOrder(poolKey, tick, amount, zeroForOne);
+
+        // Note the new balance of token0 we have
+        uint256 newBalance = token0.balanceOf(address(this));
+
+        // Since we deployed the pool contract with tick spacing = 60
+        // i.e. the tick can only be a multiple of 60
+        // and initially the tick is 0
+        // the tickLower should be 60 since we placed an order at tick 100
+        assertEq(tickLower, 60);
+
+        // Ensure that our balance was reduced by `amount` tokens
+        assertEq(originalBalance - newBalance, amount);
+
+        // Check the balance of ERC-1155 tokens we received
+        uint256 tokenId = hook.getTokenId(poolKey, tickLower, zeroForOne);
+        uint256 tokenBalance = hook.balanceOf(address(this), tokenId);
+
+        // Ensure that we were, in fact, given ERC-1155 tokens for the order
+        // equal to the `amount` of token0 tokens we placed the order for
+        assertTrue(tokenId != 0);
+        assertEq(tokenBalance, amount);
+    }
+
 }
